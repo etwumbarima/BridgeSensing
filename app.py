@@ -4,6 +4,7 @@ import hmac
 import io
 import json
 from pathlib import Path
+import re
 import secrets
 import time
 from zoneinfo import ZoneInfo
@@ -14,12 +15,26 @@ import streamlit.components.v1 as components
 from PIL import Image, ImageDraw
 
 from backend import Manager, radar_url
+from ottrk_export import export_ottrk, suggested_start
+from radar_map import camera_radar_map
+from weather_planning import render_weather_planning, weather_notifications
 
-st.set_page_config(page_title='Florida 511 Research Observatory',page_icon='🚦',layout='wide')
+LOGO = Path(__file__).resolve().parent / 'assets' / 'intelliviz-logo.png'
+st.set_page_config(page_title='INTELLIVIZ',page_icon=str(LOGO.with_name('intelliviz-icon.png')),layout='wide')
 st.markdown('''<style>
-.stApp{background:#f3f6f2}h1,h2,h3{color:#173c39}div[data-testid="stMetric"]{background:white;border:1px solid #dbe5df;border-radius:10px;padding:16px}
-section[data-testid="stSidebar"]{background:#123c3a}section[data-testid="stSidebar"] *{color:#e6f2e8}section[data-testid="stSidebar"] input{color:#163c38}
-section[data-testid="stSidebar"] a,section[data-testid="stSidebar"] a *{color:#123c3a!important}
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap');
+.stApp, .stApp button, .stApp input {font-family:"Instrument Sans","Segoe UI",sans-serif}
+.stMain .block-container {padding-top:3.6rem;max-width:1560px}
+.stMain h1 {letter-spacing:-.035em;font-weight:700}
+[data-testid="stMetric"] {
+  background:#fff;border:1px solid #dde5ee;border-top:3px solid #dc943c;
+  border-radius:12px;padding:14px 16px;box-shadow:0 2px 6px #1928380a
+}
+.st-key-intelliviz_brand {background:#fff;border-radius:10px;padding:5px 10px}
+.st-key-camera_directory_filters {
+  background:#fff;border:1px solid #dde5ee;border-radius:12px;padding:16px
+}
+.stMain [data-testid="stVerticalBlockBorderWrapper"] {border-radius:12px}
 </style>''',unsafe_allow_html=True)
 
 
@@ -29,7 +44,7 @@ def check_access():
     except (FileNotFoundError,st.errors.StreamlitSecretNotFoundError):
         password=''
     if password and not st.session_state.get('authorized'):
-        st.title('Florida 511 · Research workspace')
+        st.image(str(LOGO), width=320)
         with st.form('sign_in'):
             entered=st.text_input('App password',type='password')
             if st.form_submit_button('Sign in'):
@@ -96,9 +111,10 @@ if st.session_state.get('bound_camera')!=focus:
         except ValueError as error: st.session_state.live_error=str(error)
 
 with st.sidebar:
-    st.title('F511')
-    st.caption('RESEARCH OBSERVATORY')
-    page=st.radio('Workspace',['Cameras','Live conditions','Recordings','Video analysis'],key='page')
+    with st.container(key='intelliviz_brand'):
+        st.image(str(LOGO), width='stretch')
+    page=st.radio('Workspace',['Cameras','Live conditions','Weather Planning','Recordings','Video analysis','Driving Events','Road Conditions'],key='page')
+    weather_notifications()
     st.divider()
     st.caption('Selected cameras')
     for cid in st.session_state.selected_ids:
@@ -110,11 +126,10 @@ with st.sidebar:
     with st.expander('Hosting limits'):
         st.write('Streamlit Community Cloud may sleep, reboot, or run out of CPU/memory. Scheduled captures work only while this app process remains running. Local files are not durable cloud storage. One inference worker and four overlapping recordings are allowed per app instance.')
 
-if page!='Live conditions' and workspace.preview.camera_id:
+if page not in ('Live conditions', 'Weather Planning') and workspace.preview.camera_id:
     workspace.preview.stop()
 
-st.caption('FLORIDA TRAFFIC OBSERVATORY')
-st.title({'Cameras':'Your next dataset starts here.','Live conditions':'Live traffic, vehicle counts & weather','Recordings':'Capture schedules & recordings','Video analysis':'Vehicle detection & counting'}[page])
+st.title({'Cameras':'Florida 511 cameras','Live conditions':'Live traffic and weather','Weather Planning':'Weather Planning','Recordings':'Capture schedules & recordings','Video analysis':'Vehicle detection & counting','Driving Events':'Driving Events','Road Conditions':'Road Conditions'}[page])
 
 
 def toggle_camera(cid):
@@ -217,6 +232,24 @@ def analysis_activity():
         st.video(str(directory/'annotated.mp4'))
         for name in ('counts.csv','crossings.csv','detections.csv','summary.json','annotated.mp4'):
             download(directory/name,'Download '+name,chosen+'_'+name)
+        with st.expander('Export tracks for OTAnalytics'):
+            st.caption('Use the start time of the first video frame. For recordings, the filename provides the scheduled start as an editable estimate. Keep the original video alongside the exported tracks.')
+            with st.form(f'ottrk_form_{chosen}'):
+                start = st.text_input('Video start (ISO 8601 with time zone)', value=suggested_start(job),
+                                      placeholder='2026-11-09T13:54:25Z')
+                if st.form_submit_button('Prepare .ottrk'):
+                    st.session_state.pop('ottrk_download', None)
+                    try:
+                        payload = export_ottrk(directory / 'detections.csv', job, start)
+                    except (KeyError, ValueError, OSError) as error:
+                        st.error(f'Could not export tracks. {error}')
+                    else:
+                        st.session_state.ottrk_download = (chosen, payload)
+            prepared = st.session_state.get('ottrk_download')
+            if prepared and prepared[0] == chosen:
+                st.download_button('Download .ottrk', prepared[1],
+                                   file_name=Path(job['source_name']).with_suffix('.ottrk').name,
+                                   mime='application/octet-stream', on_click='ignore')
     elif job.get('has_preview'):
         st.image((directory/'latest.jpg').read_bytes(),width='stretch')
 
@@ -231,13 +264,28 @@ if page=='Cameras':
                 with workspace.sync_lock: workspace.recorder.sync_catalog()
             st.rerun()
         except Exception as error: st.error(str(error))
-    query=st.text_input('Search cameras','',placeholder='Location, road, county or camera ID')
-    cols=st.columns(3)
-    region=cols[0].selectbox('Region',['All']+sorted({c['region'] for c in cameras if c['region']}))
-    county=cols[1].selectbox('County',['All']+sorted({c['county'] for c in cameras if c['county']}))
-    roadway=cols[2].selectbox('Roadway',['All']+sorted({c['roadway'] for c in cameras if c['roadway']}))
-    video_only=st.checkbox('Video-enabled cameras only',value=True)
+    with st.container(key='camera_directory_filters'):
+        query=st.text_input('Search cameras','',placeholder='Location, road, county or camera ID')
+        cols=st.columns(3)
+        region=cols[0].selectbox('Region',['All']+sorted({c['region'] for c in cameras if c['region']}))
+        county=cols[1].selectbox('County',['All']+sorted({c['county'] for c in cameras if c['county']}))
+        roadway=cols[2].selectbox('Roadway',['All']+sorted({c['roadway'] for c in cameras if c['roadway']}))
+        video_only=st.checkbox('Video-enabled cameras only',value=True)
+        rest_facilities_only = st.checkbox(
+            'Rest areas, service plazas, and welcome centers only',
+            help='Matches facility names in the Florida 511 camera catalog. Preview the camera to see what it covers.')
+        bridges_only = st.checkbox(
+            'Bridge and causeway cameras only',
+            help='Matches bridge-related names in the catalog, including approaches. With both location filters selected, shows either category.')
     matches=[camera for camera in cameras if (not video_only or camera['available']) and (region=='All' or camera['region']==region) and (county=='All' or camera['county']==county) and (roadway=='All' or camera['roadway']==roadway) and (not query or query.casefold() in ' '.join(str(camera.get(k,'')) for k in ('id','name','roadway','region','county','direction')).casefold())]
+    if rest_facilities_only or bridges_only:
+        facility_terms = ('rest area', 'service plaza', 'welcome center')
+        bridge_terms = re.compile(r'\b(?:bridge|brdg|causeway|skyway)\b(?!\s+(?:road|rd)\b)', re.I)
+        matches = [camera for camera in matches
+                   if (rest_facilities_only and any(
+                       term in ' '.join(camera['name'].casefold().replace('-', ' ').split())
+                       for term in facility_terms))
+                   or (bridges_only and bridge_terms.search(camera['name']))]
     st.caption(f'{len(matches):,} matching cameras. Select up to four, then open Live conditions or Recordings.')
     if st.session_state.pop('selection_error',None): st.warning('Select up to four cameras.')
     pages=max(1,(len(matches)+11)//12)
@@ -289,14 +337,40 @@ elif page=='Live conditions':
     with right:
         st.subheader('Weather radar')
         regions={'Follow selected camera':None,'Florida mosaic':'florida','Tallahassee':'KTLH','Panhandle':'KEVX','Jacksonville':'KJAX','Tampa Bay':'KTBW','Melbourne':'KMLB','Miami':'KAMX','Key West':'KBYX'}
-        radar=st.selectbox('Radar view',list(regions))
+        radar=st.selectbox('Radar view',list(regions),key=f"radar_view_{camera['id']}")
         target=regions[radar]
         url=radar_url(camera if target is None else None,station=target if target not in (None,'florida') else None)
         if st.button('Reload radar'): st.session_state.radar_reload=st.session_state.get('radar_reload',0)+1
-        url+='&reload='+str(st.session_state.get('radar_reload',0)) if '?' in url else '?reload='+str(st.session_state.get('radar_reload',0))
-        components.iframe(url,height=670,scrolling=False)
+        reload_count = st.session_state.get('radar_reload', 0)
+        marked_map = camera_radar_map(camera, reload_count) if target is None else None
+        if marked_map:
+            components.html(marked_map, height=670, scrolling=False)
+            st.caption('NHC overlays show 48-hour disturbance locations (dashed circles) and 7-day potential development areas and locations. Select Show camera and outlook to zoom out to both. Colors indicate formation probability.')
+        else:
+            if target is None:
+                st.caption('Florida 511 has no usable coordinates for this camera.')
+            separator = '&' if '?' in url else '?'
+            components.iframe(f'{url}{separator}reload={reload_count}', height=670, scrolling=False)
         st.link_button('Open / expand NWS radar ↗',url)
-        st.caption('NOAA / National Weather Service. Check the radar scan timestamp: source video and weather have independent publication delays.')
+        st.caption('NOAA / National Weather Service. Open the NWS viewer for scan timestamps and radar playback.')
+
+        st.subheader('Atlantic Tropical Weather Outlook')
+        horizon = st.radio('Formation outlook period', [2, 7], index=1, horizontal=True,
+                           format_func=lambda days: '48 hours' if days == 2 else '7 days')
+        refresh = int(time.time() // 900)
+        outlook_url = f'https://www.nhc.noaa.gov/xgtwo/two_atl_{horizon}d0.png'
+        st.image(f'{outlook_url}?v={refresh}-{reload_count}', width='stretch')
+        st.caption('NHC shading shows where a tropical cyclone could form. Yellow is below 40%, orange is 40–60%, and red is above 60%. Formation probabilities and local wind or surge forecasts measure different hazards. Check the issuance time printed on the map.')
+        outlook, hazards = st.columns(2)
+        outlook.link_button('Open NHC outlook', 'https://www.nhc.noaa.gov/gtwo.php?basin=atlc')
+        hazards.link_button('Storm surge and advisories', 'https://www.nhc.noaa.gov/')
+        latitude, longitude = camera.get('latitude'), camera.get('longitude')
+        if isinstance(latitude, (int, float)) and isinstance(longitude, (int, float)):
+            st.link_button('NWS forecast and alerts at camera',
+                           f'https://forecast.weather.gov/MapClick.php?lat={latitude}&lon={longitude}')
+
+elif page == 'Weather Planning':
+    render_weather_planning(cameras, workspace.preview)
 
 elif page=='Recordings':
     st.info('Schedules run only while this hosted app process is awake. Community Cloud sleep/restarts can interrupt captures; download files before redeploying.')
@@ -349,6 +423,104 @@ elif page=='Video analysis':
     else:
         st.info('Upload a video or complete a camera recording to begin.')
     analysis_activity()
+
+elif page == 'Driving Events':
+    from driving_events import find_braking, review_clip, road_projection
+
+    st.caption('Hard-braking candidates from recorded video. Estimates use a fixed camera, a measured road patch and the video frame rate. Review each clip for tracking errors or camera movement.')
+    jobs = [job for job in workspace.analysis.states() if job['status'] == 'completed']
+    if not jobs:
+        st.info('Open Video analysis, select a finished recording or upload, and run Detect, track & count. Completed analyses appear here.')
+        st.stop()
+    by_job = {job['id']: job for job in jobs}
+    selected = st.selectbox('Completed video analysis', list(by_job),
+                            format_func=lambda jid: f"{by_job[jid]['source_name']} · {jid}")
+    job = by_job[selected]
+    directory = workspace.analysis.job_path(selected)
+    if job['fps'] < 5:
+        st.warning('This recording is below the five frames per second required for braking screening.')
+        st.stop()
+    st.subheader('Calibrate the road')
+    st.write('Use a straight, level road patch with measured width and length. Enter image coordinates as x,y percentages from the top-left. Start at one end of the road patch, enter both corners across the road, then enter the two corners at the opposite end in reverse order.')
+    with st.expander('Show frame with coordinate grid', expanded=True):
+        try:
+            image = Image.open(io.BytesIO(thumbnail(key, job['source']))).convert('RGB')
+            draw = ImageDraw.Draw(image)
+            for percent in range(10, 100, 10):
+                x, y = image.width * percent / 100, image.height * percent / 100
+                draw.line((x, 0, x, image.height), fill='yellow')
+                draw.line((0, y, image.width, y), fill='yellow')
+                draw.text((x + 2, 4), str(percent), fill='yellow', stroke_width=1, stroke_fill='black')
+                draw.text((4, y + 2), str(percent), fill='yellow', stroke_width=1, stroke_fill='black')
+            st.image(image, width='stretch')
+        except (OSError, ValueError) as error:
+            st.info(f'Frame preview unavailable. {error}')
+    with st.form(f'braking_calibration_{selected}'):
+        corners = st.text_input('Four corners, separated by semicolons', placeholder='35,30; 55,30; 75,85; 15,85')
+        left, middle, right = st.columns(3)
+        width = left.number_input('Road width (m)', min_value=0.0, value=0.0)
+        length = middle.number_input('Road length (m)', min_value=0.0, value=0.0)
+        threshold = right.number_input('Braking threshold (m/s²)', min_value=1.0, max_value=15.0, value=3.0, step=0.5)
+        scan = st.form_submit_button('Find hard-braking candidates', type='primary')
+    if scan:
+        st.session_state.pop('braking_result', None)
+        st.session_state.pop('braking_clip', None)
+        try:
+            if width <= 0 or length <= 0:
+                raise ValueError('Enter measured road width and length greater than zero.')
+            points = [[float(value.strip()) / 100 for value in pair.split(',')] for pair in corners.split(';')]
+            calibration = road_projection(points, width, length)
+            with st.spinner('Screening vehicle trajectories…'):
+                events, tracks = find_braking(directory / 'detections.csv', job['width'], job['height'],
+                                              job['fps'], calibration, threshold)
+            for event in events:
+                event.update(review='Unreviewed', threshold_mps2=threshold, road_width_m=width,
+                             road_length_m=length, image_corners=corners)
+            st.session_state.braking_result = (selected, events, tracks)
+        except (ValueError, OSError) as error:
+            st.error(str(error))
+    result = st.session_state.get('braking_result')
+    if result and result[0] == selected:
+        _, events, tracks = result
+        st.subheader(f'{len(events)} candidate events')
+        if events:
+            index = st.selectbox('Event to review', range(len(events)), format_func=lambda i:
+                                 f"{events[i]['seconds']:.2f} s · {events[i]['vehicle_type']} "
+                                 f"#{events[i]['track_id']} · {events[i]['deceleration_mps2']:.2f} m/s²")
+            event = events[index]
+            if st.button('Generate review clip'):
+                ffmpeg = workspace.analysis.ffmpeg()
+                if not ffmpeg:
+                    st.error('FFmpeg is required for review clips.')
+                else:
+                    try:
+                        with st.spinner('Rendering the vehicle trajectory…'):
+                            clip = review_clip(directory / 'annotated.mp4', ffmpeg, event['seconds'],
+                                               tracks[event['track_id']])
+                        st.session_state.braking_clip = (selected, index, clip)
+                    except (OSError, ValueError, TimeoutError) as error:
+                        st.error(str(error))
+            clip = st.session_state.get('braking_clip')
+            if clip and clip[:2] == (selected, index):
+                st.video(clip[2])
+                st.caption('The magenta dot and trail show the selected vehicle’s tracked path.')
+            with st.form(f'braking_review_{selected}_{index}'):
+                labels = ['Unreviewed', 'Confirmed braking', 'False positive', 'Uncertain']
+                review = st.selectbox('Review outcome', labels, index=labels.index(event['review']))
+                if st.form_submit_button('Save review'):
+                    event['review'] = review
+            table = pd.DataFrame(events)
+            st.dataframe(table[['seconds', 'track_id', 'vehicle_type', 'deceleration_mps2', 'review']])
+            st.download_button('Export candidates and reviews', table.to_csv(index=False),
+                               file_name=f'driving-events-{selected}.csv', mime='text/csv', on_click='ignore')
+            st.caption('Review outcomes are held in this browser session. Export them before closing or reloading the app.')
+        else:
+            st.info('No tracks met the braking threshold inside the calibrated patch.')
+
+elif page == 'Road Conditions':
+    from road_conditions import render_road_conditions
+
+    render_road_conditions(workspace)
 
 st.divider()
 st.caption('Camera data: Florida 511 / FDOT · Radar: NOAA / NWS · Independent research application. Save this workspace URL; do not share it if its files should remain private.')

@@ -1,14 +1,21 @@
 [server]
 headless = true
 maxUploadSize = 200
-fileWatcherType = "none"
+fileWatcherType = "poll"
+runOnSave = true
 
 [browser]
 gatherUsageStats = false
 
 [theme]
-primaryColor = "#08766B"
-backgroundColor = "#F3F6F2"
-secondaryBackgroundColor = "#E6EEE7"
-textColor = "#173C39"
+primaryColor = "#A45208"
+backgroundColor = "#F4F6F9"
+secondaryBackgroundColor = "#E7EDF4"
+textColor = "#202E3D"
 font = "sans serif"
+
+[theme.sidebar]
+primaryColor = "#F7B85D"
+backgroundColor = "#192838"
+secondaryBackgroundColor = "#293D52"
+textColor = "#F1F5FA"
